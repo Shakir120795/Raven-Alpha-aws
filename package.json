@@ -1,0 +1,17 @@
+{
+  "name": "raven-alpha-aws",
+  "version": "1.0.0",
+  "description": "Raven Alpha — 24/7 wallet mint/token alert tracker on AWS EC2",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-cron": "^3.0.3",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

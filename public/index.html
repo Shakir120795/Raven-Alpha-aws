@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>🍌 Raven Alpha</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root { --bg:#0B0E14; --panel:#131722; --line:#232838; --txt:#E8EAED; --dim:#8B92A8; --amb:#F5C843; --pos:#00D4AA; --neg:#FF5A5A; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 24px 16px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: var(--dim); font-size: 12px; margin-bottom: 20px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .panel h2 { font-size: 14px; margin: 0 0 12px; }
+  input, select { width: 100%; background: #0F1320; border: 1px solid var(--line); color: var(--txt); padding: 10px; border-radius: 8px; font-size: 13px; margin-bottom: 8px; }
+  button { background: var(--amb); color: #000; border: none; padding: 10px 16px; border-radius: 8px; font-weight: 700; font-size: 13px; cursor: pointer; }
+  button.danger { background: var(--neg); color: #fff; }
+  button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--line); }
+  .row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); gap: 8px; }
+  .row:last-child { border-bottom: none; }
+  .tag { font-size: 10px; padding: 2px 8px; border-radius: 999px; background: var(--line); color: var(--dim); }
+  .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 12px; }
+  .status-item { background: #0F1320; border-radius: 8px; padding: 10px; }
+  .status-item .k { color: var(--dim); font-size: 10px; }
+  .status-item .v { font-weight: 700; margin-top: 2px; }
+  .minters { font-size: 11px; color: var(--amb); margin-top: 4px; }
+  .empty { color: var(--dim); font-size: 12px; padding: 12px 0; }
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🍌 Raven Alpha</h1>
+  <div class="sub">Wallet-only alerts — new token buys & NFT mints on your tracked wallets, 24/7 via AWS.</div>
+
+  <div class="panel">
+    <h2>📊 Status</h2>
+    <div class="status-grid" id="statusGrid"></div>
+  </div>
+
+  <div class="panel">
+    <h2>👛 Tracked Wallets</h2>
+    <div class="form-grid">
+      <input id="addr" placeholder="0x wallet address" />
+      <select id="chain"></select>
+    </div>
+    <input id="label" placeholder="Label (optional)" />
+    <div class="form-grid">
+      <button onclick="addWallet()">+ Add Wallet</button>
+      <input id="secret" placeholder="Dashboard secret (if set)" type="password" />
+    </div>
+    <div id="walletList" style="margin-top:12px;"></div>
+  </div>
+
+  <div class="panel">
+    <h2>🔔 Alert Log</h2>
+    <div id="alertList"></div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const secretHeader = () => ({ "x-dashboard-secret": $("secret").value || "" });
+
+async function loadChains() {
+  const chains = await fetch("/api/chains").then(r => r.json());
+  $("chain").innerHTML = chains.map(c =>
+    `<option value="${c.id}" ${c.comingSoon ? "disabled" : ""}>${c.name}${c.comingSoon ? " (coming soon)" : ""}</option>`
+  ).join("");
+}
+
+async function loadStatus() {
+  const s = await fetch("/api/status").then(r => r.json());
+  $("statusGrid").innerHTML = `
+    <div class="status-item"><div class="k">Wallets tracked</div><div class="v">${s.walletsCount}</div></div>
+    <div class="status-item"><div class="k">Last scan</div><div class="v">${s.lastScan ? new Date(s.lastScan.at).toLocaleTimeString() : "—"}</div></div>
+    <div class="status-item"><div class="k">Telegram</div><div class="v">${s.telegramConfigured ? "✅ configured" : "⚠️ not set"}</div></div>
+    <div class="status-item"><div class="k">Discord</div><div class="v">${s.discordConfigured ? "✅ configured" : "⚠️ not set"}</div></div>
+  `;
+}
+
+async function loadWallets() {
+  const wallets = await fetch("/api/wallets").then(r => r.json());
+  $("walletList").innerHTML = wallets.length ? wallets.map(w => `
+    <div class="row">
+      <div>
+        <div style="font-weight:600;font-size:13px;">${w.label}</div>
+        <div style="font-size:10px;color:var(--dim);">${w.address}</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span class="tag">${w.chain}</span>
+        <button class="danger" onclick="removeWallet('${w.id}')">✕</button>
+      </div>
+    </div>
+  `).join("") : `<div class="empty">Koi wallet add nahi hui abhi tak.</div>`;
+}
+
+async function loadAlerts() {
+  const alerts = await fetch("/api/alerts").then(r => r.json());
+  $("alertList").innerHTML = alerts.length ? alerts.slice(0, 30).map(a => {
+    const title = a.type === "wallet_nft_mint" ? `🖼️ ${a.nftName || "NFT Mint"}` : `🆕 ${a.tokenName || "New Token"}`;
+    const minters = (a.minters || []).length
+      ? `<div class="minters">👥 ${a.minters.length} tracked wallet${a.minters.length > 1 ? "s" : ""} minted this: ${a.minters.map(m => m.label).join(", ")}</div>`
+      : "";
+    return `
+      <div class="row" style="flex-direction:column;align-items:flex-start;">
+        <div style="display:flex;justify-content:space-between;width:100%;">
+          <div style="font-weight:600;font-size:13px;">${title}</div>
+          <span class="tag">${a.chain?.toUpperCase() || ""}</span>
+        </div>
+        <div style="font-size:10px;color:var(--dim);">${a.walletLabel} · ${new Date(a.sentAt).toLocaleString()}</div>
+        ${minters}
+      </div>
+    `;
+  }).join("") : `<div class="empty">Abhi koi alert nahi gaya.</div>`;
+}
+
+async function addWallet() {
+  const address = $("addr").value.trim();
+  const chain = $("chain").value;
+  const label = $("label").value.trim();
+  if (!address) return alert("Address daalo");
+  const res = await fetch("/api/wallets", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...secretHeader() },
+    body: JSON.stringify({ address, chain, label }),
+  });
+  if (!res.ok) { const j = await res.json(); alert(j.error || "Failed"); return; }
+  $("addr").value = ""; $("label").value = "";
+  loadWallets();
+}
+
+async function removeWallet(id) {
+  await fetch(`/api/wallets/${id}`, { method: "DELETE", headers: secretHeader() });
+  loadWallets();
+}
+
+async function refreshAll() {
+  await Promise.all([loadStatus(), loadWallets(), loadAlerts()]);
+}
+
+loadChains();
+refreshAll();
+setInterval(refreshAll, 15000); // auto-refresh every 15s
+</script>
+</body>
+</html>
