@@ -5,6 +5,34 @@ const path = require("path");
 
 const store = require("./lib/store");
 const { getWallets, addWallet, removeWallet } = require("./lib/wallets");
+
+// Optional NFT metadata/supply calls often revert on contracts that do not
+// implement the requested selector. Treat those as "unsupported" instead of
+// making the RPC helper retry three times and flooding the logs.
+const nativeFetch = globalThis.fetch;
+globalThis.fetch = async (input, init = {}) => {
+  try {
+    if ((init?.method || "GET").toUpperCase() === "POST" && typeof init?.body === "string") {
+      const payload = JSON.parse(init.body);
+      if (payload?.jsonrpc === "2.0" && payload?.method === "eth_call") {
+        const response = await nativeFetch(input, init);
+        if (response.ok) {
+          const body = await response.clone().json().catch(() => null);
+          const message = body?.error?.message || "";
+          if (body?.error && /execution reverted|function does not exist/i.test(message)) {
+            return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: "0x" }), {
+              status: 200,
+              headers: { "content-type": "application/json" }
+            });
+          }
+        }
+        return response;
+      }
+    }
+  } catch {}
+  return nativeFetch(input, init);
+};
+
 const { runNftScan } = require("./lib/nftScanner");
 const { CHAINS, ACTIVE_CHAIN_IDS } = require("./lib/chains");
 
