@@ -34,6 +34,7 @@ globalThis.fetch = async (input, init = {}) => {
 };
 
 const { runNftScan } = require("./lib/nftScanner");
+const { runArcTokenScan } = require("./lib/arcTokenScanner");
 const { CHAINS, ACTIVE_CHAIN_IDS } = require("./lib/chains");
 
 const app = express();
@@ -80,8 +81,9 @@ app.get("/api/status", (req, res) => {
 
 app.post("/api/scan", requireSecret, async (req, res) => {
   try {
-    const result = await runNftScan();
-    res.json({ ok: true, ...result });
+    const nft = await runNftScan();
+    const arcToken = await runArcTokenScan();
+    res.json({ ok: true, nft, arcToken });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -91,22 +93,33 @@ app.listen(PORT, () => {
   console.log(`🍌 Raven Alpha server running on port ${PORT}`);
 });
 
-// NFT-only 24/7 engine. One scan at a time; the scanner has its own lock,
-// so a slow cycle can never overlap with the next cycle or a manual scan.
+async function runScheduledScan() {
+  const nft = await runNftScan();
+  const arcToken = await runArcTokenScan();
+
+  if (nft.skipped) {
+    console.log(`[${new Date().toISOString()}] NFT scan skipped:`, nft.reason);
+  } else {
+    console.log(`[${new Date().toISOString()}] NFT scan done:`, nft.walletsScanned || 0, "wallets,", nft.nftMints || 0, "new mints,", nft.alertsSent || 0, "collection alerts");
+  }
+
+  if (arcToken?.skipped) {
+    console.log(`[${new Date().toISOString()}] Arc token scan skipped:`, arcToken.reason);
+  } else {
+    console.log(`[${new Date().toISOString()}] Arc token scan:`, arcToken?.walletsScanned || 0, "wallets,", arcToken?.tokenTransfers || 0, "incoming ERC20 transfers,", arcToken?.tokenAlerts || 0, "new-token alerts");
+  }
+}
+
+// NFT + Arc-token 24/7 engine. Arc token tracking is isolated to Arc only;
+// ETH/Robinhood/Ink token tracking remains OFF.
 cron.schedule("*/5 * * * *", async () => {
-  console.log(`[${new Date().toISOString()}] Running NFT scan...`);
+  console.log(`[${new Date().toISOString()}] Running NFT + Arc token scan...`);
   try {
-    const result = await runNftScan();
-    if (result.skipped) {
-      console.log(`[${new Date().toISOString()}] NFT scan skipped:`, result.reason);
-      return;
-    }
-    console.log(`[${new Date().toISOString()}] NFT scan done:`, result.walletsScanned, "wallets,", result.nftMints, "new mints,", result.alertsSent, "collection alerts");
+    await runScheduledScan();
   } catch (e) {
-    console.error("NFT scan failed:", e.message);
+    console.error("NFT/Arc token scan failed:", e.message);
   }
 });
 
-runNftScan()
-  .then(r => console.log("Initial NFT scan:", r.walletsScanned || 0, "wallets,", r.nftMints || 0, "new mints,", r.alertsSent || 0, "collection alerts"))
-  .catch(e => console.error("Initial NFT scan failed:", e.message));
+runScheduledScan()
+  .catch(e => console.error("Initial NFT/Arc token scan failed:", e.message));
