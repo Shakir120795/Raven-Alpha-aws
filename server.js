@@ -6,9 +6,6 @@ const path = require("path");
 const store = require("./lib/store");
 const { getWallets, addWallet, removeWallet } = require("./lib/wallets");
 
-// Optional NFT metadata/supply calls often revert on contracts that do not
-// implement the requested selector. Treat those as "unsupported" instead of
-// making the RPC helper retry three times and flooding the logs.
 const nativeFetch = globalThis.fetch;
 globalThis.fetch = async (input, init = {}) => {
   const url = typeof input === "string" ? input : input?.url || "";
@@ -18,55 +15,33 @@ globalThis.fetch = async (input, init = {}) => {
   let payload = null;
   try { if (bodyText) payload = JSON.parse(bodyText); } catch {}
 
-  // Arc primary RPC failover. The official Arcscan gateway remains first;
-  // backup is used only when the primary request fails or returns a JSON-RPC
-  // error. This is intentionally limited to Arc so other chains are untouched.
   if (isArcRpc && method === "POST" && payload?.jsonrpc === "2.0") {
     try {
       const response = await nativeFetch(input, init);
       if (response.ok) {
         const body = await response.clone().json().catch(() => null);
         const message = body?.error?.message || "";
-
-        // Preserve the existing optional eth_call-revert suppression.
         if (body?.error && payload.method === "eth_call" && /execution reverted|function does not exist/i.test(message)) {
-          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: "0x" }), {
-            status: 200,
-            headers: { "content-type": "application/json" }
-          });
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: "0x" }), { status: 200, headers: { "content-type": "application/json" } });
         }
-
-        // A healthy JSON-RPC result from the primary is returned directly.
         if (!body?.error) return response;
       }
     } catch {}
-
     try {
       const backup = await nativeFetch("https://niorfun.com/api/rpc", init);
       if (backup.ok) {
         const backupBody = await backup.clone().json().catch(() => null);
         const backupMessage = backupBody?.error?.message || "";
         if (backupBody?.error && payload.method === "eth_call" && /execution reverted|function does not exist/i.test(backupMessage)) {
-          return new Response(JSON.stringify({ jsonrpc: "2.0", id: backupBody.id, result: "0x" }), {
-            status: 200,
-            headers: { "content-type": "application/json" }
-          });
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: backupBody.id, result: "0x" }), { status: 200, headers: { "content-type": "application/json" } });
         }
       }
       return backup;
     } catch (e) {
-      return new Response(JSON.stringify({
-        jsonrpc: "2.0",
-        id: payload.id ?? null,
-        error: { code: -32001, message: `Arc RPC unavailable: ${e?.message || "backup RPC failed"}` }
-      }), {
-        status: 503,
-        headers: { "content-type": "application/json" }
-      });
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: payload.id ?? null, error: { code: -32001, message: `Arc RPC unavailable: ${e?.message || "backup RPC failed"}` } }), { status: 503, headers: { "content-type": "application/json" } });
     }
   }
 
-  // Existing generic eth_call-revert handling for all other RPCs.
   try {
     if (method === "POST" && bodyText && payload?.jsonrpc === "2.0" && payload?.method === "eth_call") {
       const response = await nativeFetch(input, init);
@@ -74,16 +49,145 @@ globalThis.fetch = async (input, init = {}) => {
         const body = await response.clone().json().catch(() => null);
         const message = body?.error?.message || "";
         if (body?.error && /execution reverted|function does not exist/i.test(message)) {
-          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: "0x" }), {
-            status: 200,
-            headers: { "content-type": "application/json" }
-          });
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: "0x" }), { status: 200, headers: { "content-type": "application/json" } });
         }
       }
       return response;
     }
   } catch {}
   return nativeFetch(input, init);
+};
+
+function walletDisplay(w) { return w?.label || w?.address || "unknown"; }
+function shortenWallet(a = "") { return a.length > 12 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a; }
+function alertWalletDisplay(w) { return w?.label || shortenWallet(w?.address || "unknown"); }
+
+function getCollectionWalletStats(chainId, contract, currentWallets) {
+  const key = `${String(chainId || "").toLowerCase()}:${String(contract || "").toLowerCase()}`;
+  const totals = new Map();
+  const logs = store.get("alerts_log", []);
+  for (const alert of logs) {
+    if (alert?.type !== "wallet_nft_mint_batch") continue;
+    const alertKey = `${String(alert.chain || "").toLowerCase()}:${String(alert.contract || "").toLowerCase()}`;
+    if (alertKey !== key) continue;
+    for (const w of alert.wallets || []) {
+      const display = alertWalletDisplay(w);
+      const id = String(w?.address || w?.walletId || display).toLowerCase();
+      const existing = totals.get(id) || { id, display, count: 0 };
+      existing.display = display;
+      existing.count += Number(w?.count || 0);
+      totals.set(id, existing);
+    }
+  }
+
+  const current = [];
+  for (const w of currentWallets || []) {
+    const display = alertWalletDisplay(w);
+    const id = String(w?.address || w?.walletId || display).toLowerCase();
+    current.push({ id, display, count: Number(w?.count || 0) });
+    const existing = totals.get(id) || { id, display, count: 0 };
+    existing.display = display;
+    existing.count += Number(w?.count || 0);
+    totals.set(id, existing);
+  }
+
+  const top = [...totals.values()].sort((a, b) => b.count - a.count || a.display.localeCompare(b.display));
+  const currentIds = new Set(current.map(w => w.id));
+  const newWallets = current.filter(w => !logs.some(alert => {
+    if (alert?.type !== "wallet_nft_mint_batch") return false;
+    const alertKey = `${String(alert.chain || "").toLowerCase()}:${String(alert.contract || "").toLowerCase()}`;
+    if (alertKey !== key) return false;
+    return (alert.wallets || []).some(prev => String(prev?.address || prev?.walletId || alertWalletDisplay(prev)).toLowerCase() === w.id);
+  })).sort((a, b) => b.count - a.count || a.display.localeCompare(b.display));
+
+  return { totalWallets: totals.size, top, current, currentIds, newWallets };
+}
+
+function formatWalletRows(stats, maxRows = 12) {
+  const rows = stats.top.slice(0, maxRows).map((w, i) => `${i + 1}. ${w.display} ×${w.count}`);
+  const remaining = stats.top.length - maxRows;
+  if (remaining > 0) rows.push(`… +${remaining} more wallets`);
+  return rows.join("\n") || "—";
+}
+
+function formatNewWalletRows(stats, maxRows = 12) {
+  const rows = stats.newWallets.slice(0, maxRows).map(w => `🆕 ${w.display} ×${w.count}`);
+  const remaining = stats.newWallets.length - maxRows;
+  if (remaining > 0) rows.push(`… +${remaining} more new wallets`);
+  return rows.join("\n") || "None";
+}
+
+function enrichTelegramNft(payload) {
+  const text = String(payload?.text || "");
+  if (!/NEW NFT MINT/i.test(text)) return payload;
+  const chainMatch = text.match(/NEW NFT MINT<\/b>\s*·\s*<b>([^<]+)<\/b>/i);
+  const contractMatch = text.match(/📄 Contract:\s*<code>(0x[a-fA-F0-9]+)<\/code>/i);
+  const breakdownStart = text.indexOf("<b>Wallet Breakdown</b>");
+  const supplyStart = text.indexOf("\n\n📊 Supply:", breakdownStart);
+  if (!chainMatch || !contractMatch || breakdownStart < 0 || supplyStart < 0) return payload;
+
+  const currentBlock = text.slice(breakdownStart + "<b>Wallet Breakdown</b>".length, supplyStart).trim();
+  const currentWallets = currentBlock.split("\n").map(line => line.trim()).filter(Boolean).map(line => {
+    const m = line.match(/^(.+?)\s+×(\d+)$/);
+    return m ? { label: m[1], count: Number(m[2]) } : null;
+  }).filter(Boolean);
+
+  const stats = getCollectionWalletStats(chainMatch[1], contractMatch[1], currentWallets.map(w => ({ label: w.label, count: w.count })));
+  const summary = [
+    `<b>Wallet Summary</b>`,
+    `👥 Total collection wallets: <b>${stats.totalWallets}</b>`,
+    `🔥 Wallets this scan: <b>${currentWallets.length}</b>`,
+    `\n🏆 <b>Top wallets · all tracked mints</b>`,
+    formatWalletRows(stats),
+    `\n🆕 <b>New wallets this scan</b>`,
+    formatNewWalletRows(stats)
+  ].join("\n");
+
+  payload.text = text.slice(0, breakdownStart) + summary + text.slice(supplyStart);
+  return payload;
+}
+
+function enrichDiscordNft(payload) {
+  const embed = payload?.embeds?.[0];
+  if (!embed || !/NEW NFT MINT/i.test(String(embed.title || ""))) return payload;
+  const chainMatch = String(embed.description || "").match(/·\s*([A-Z0-9_-]+)$/);
+  const contractField = (embed.fields || []).find(f => f?.name === "Contract");
+  const breakdownField = (embed.fields || []).find(f => f?.name === "Wallet Breakdown");
+  const contract = String(contractField?.value || "").replace(/[`\\]/g, "").trim();
+  if (!chainMatch || !contract || !breakdownField) return payload;
+
+  const currentWallets = String(breakdownField.value || "").split("\n").map(line => line.trim()).filter(Boolean).map(line => {
+    const m = line.match(/^(.+?)\s+×(\d+)$/);
+    return m ? { label: m[1].replace(/^\*\*/, "").replace(/\*\*$/, ""), count: Number(m[2]) } : null;
+  }).filter(Boolean);
+  const stats = getCollectionWalletStats(chainMatch[1], contract, currentWallets.map(w => ({ label: w.label, count: w.count })));
+
+  const fields = (embed.fields || []).filter(f => !["Wallet Breakdown", "Total Wallets", "New Wallets"].includes(f?.name));
+  fields.push({ name: "Total Wallets", value: String(stats.totalWallets), inline: true });
+  fields.push({ name: "Top Wallets · all tracked mints", value: formatWalletRows(stats, 10), inline: false });
+  fields.push({ name: "New Wallets This Scan", value: formatNewWalletRows(stats, 10), inline: false });
+  embed.fields = fields;
+  return payload;
+}
+
+// Enrich NFT notifications with cumulative collection wallet totals. This runs
+// only for outbound Telegram/Discord alert payloads; scanner behavior and
+// ETH/Robinhood/Ink token tracking remain unchanged.
+const alertFetch = globalThis.fetch;
+globalThis.fetch = async (input, init = {}) => {
+  const url = typeof input === "string" ? input : input?.url || "";
+  const method = (init?.method || "GET").toUpperCase();
+  if (method === "POST" && typeof init?.body === "string") {
+    try {
+      const payload = JSON.parse(init.body);
+      if (/api\.telegram\.org\/bot/i.test(url)) {
+        init = { ...init, body: JSON.stringify(enrichTelegramNft(payload)) };
+      } else if (payload?.embeds?.[0]) {
+        init = { ...init, body: JSON.stringify(enrichDiscordNft(payload)) };
+      }
+    } catch {}
+  }
+  return alertFetch(input, init);
 };
 
 const { runNftScan } = require("./lib/nftScanner");
@@ -163,8 +267,6 @@ async function runScheduledScan() {
   }
 }
 
-// NFT + Arc-token 24/7 engine. Arc token tracking is isolated to Arc only;
-// ETH/Robinhood/Ink token tracking remains OFF.
 cron.schedule("*/5 * * * *", async () => {
   console.log(`[${new Date().toISOString()}] Running NFT + Arc token scan...`);
   try {
@@ -174,5 +276,4 @@ cron.schedule("*/5 * * * *", async () => {
   }
 });
 
-runScheduledScan()
-  .catch(e => console.error("Initial NFT/Arc token scan failed:", e.message));
+runScheduledScan().catch(e => console.error("Initial NFT/Arc token scan failed:", e.message));
