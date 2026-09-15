@@ -11,23 +11,76 @@ const { getWallets, addWallet, removeWallet } = require("./lib/wallets");
 // making the RPC helper retry three times and flooding the logs.
 const nativeFetch = globalThis.fetch;
 globalThis.fetch = async (input, init = {}) => {
-  try {
-    if ((init?.method || "GET").toUpperCase() === "POST" && typeof init?.body === "string") {
-      const payload = JSON.parse(init.body);
-      if (payload?.jsonrpc === "2.0" && payload?.method === "eth_call") {
-        const response = await nativeFetch(input, init);
-        if (response.ok) {
-          const body = await response.clone().json().catch(() => null);
-          const message = body?.error?.message || "";
-          if (body?.error && /execution reverted|function does not exist/i.test(message)) {
-            return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: "0x" }), {
-              status: 200,
-              headers: { "content-type": "application/json" }
-            });
-          }
+  const url = typeof input === "string" ? input : input?.url || "";
+  const isArcRpc = /^https:\/\/rpc\.arc-scan\.org\/?$/i.test(url);
+  const method = (init?.method || "GET").toUpperCase();
+  const bodyText = typeof init?.body === "string" ? init.body : null;
+  let payload = null;
+  try { if (bodyText) payload = JSON.parse(bodyText); } catch {}
+
+  // Arc primary RPC failover. The official Arcscan gateway remains first;
+  // backup is used only when the primary request fails or returns a JSON-RPC
+  // error. This is intentionally limited to Arc so other chains are untouched.
+  if (isArcRpc && method === "POST" && payload?.jsonrpc === "2.0") {
+    try {
+      const response = await nativeFetch(input, init);
+      if (response.ok) {
+        const body = await response.clone().json().catch(() => null);
+        const message = body?.error?.message || "";
+
+        // Preserve the existing optional eth_call-revert suppression.
+        if (body?.error && payload.method === "eth_call" && /execution reverted|function does not exist/i.test(message)) {
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: "0x" }), {
+            status: 200,
+            headers: { "content-type": "application/json" }
+          });
         }
-        return response;
+
+        // A healthy JSON-RPC result from the primary is returned directly.
+        if (!body?.error) return response;
       }
+    } catch {}
+
+    try {
+      const backup = await nativeFetch("https://niorfun.com/api/rpc", init);
+      if (backup.ok) {
+        const backupBody = await backup.clone().json().catch(() => null);
+        const backupMessage = backupBody?.error?.message || "";
+        if (backupBody?.error && payload.method === "eth_call" && /execution reverted|function does not exist/i.test(backupMessage)) {
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: backupBody.id, result: "0x" }), {
+            status: 200,
+            headers: { "content-type": "application/json" }
+          });
+        }
+      }
+      return backup;
+    } catch (e) {
+      return new Response(JSON.stringify({
+        jsonrpc: "2.0",
+        id: payload.id ?? null,
+        error: { code: -32001, message: `Arc RPC unavailable: ${e?.message || "backup RPC failed"}` }
+      }), {
+        status: 503,
+        headers: { "content-type": "application/json" }
+      });
+    }
+  }
+
+  // Existing generic eth_call-revert handling for all other RPCs.
+  try {
+    if (method === "POST" && bodyText && payload?.jsonrpc === "2.0" && payload?.method === "eth_call") {
+      const response = await nativeFetch(input, init);
+      if (response.ok) {
+        const body = await response.clone().json().catch(() => null);
+        const message = body?.error?.message || "";
+        if (body?.error && /execution reverted|function does not exist/i.test(message)) {
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: "0x" }), {
+            status: 200,
+            headers: { "content-type": "application/json" }
+          });
+        }
+      }
+      return response;
     }
   } catch {}
   return nativeFetch(input, init);
