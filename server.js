@@ -96,8 +96,9 @@ function updateWalletRegistry(chain, contract, wallets, eventKey) {
   return { totalWallets: top.length, top };
 }
 function parseWalletLines(value) { return String(value || "").split("\n").map(s => s.trim()).filter(Boolean).map(line => { const m = line.match(/^(.+?)\s+×(\d+)$/); return m ? { label: m[1].trim(), count: Number(m[2]) } : null; }).filter(Boolean); }
-function nftEventKey(text) { const m = String(text).match(/Sample Token ID:\s*<b>([^<]+)<\/b>/i); return m ? `token:${m[1]}` : `tx:${(String(text).match(/🧾 <code>([^<]+)/i) || [])[1] || Date.now()}`; }
-function tokenEventKey(text) { return `tx:${(String(text).match(/🧾 <code>([^<]+)/i) || [])[1] || Date.now()}`; }
+function extractTxHash(value) { const m = String(value || "").match(/0x[a-fA-F0-9]{64}/); return m ? m[0].toLowerCase() : null; }
+function nftEventKey(text) { const tx = extractTxHash(text); if (tx) return `tx:${tx}`; const m = String(text).match(/Sample Token ID:\s*<b>([^<]+)<\/b>/i); return m ? `token:${m[1]}` : null; }
+function tokenEventKey(text) { const tx = extractTxHash(text); return tx ? `tx:${tx}` : null; }
 
 function enrichTelegramNft(payload) {
   const text = String(payload?.text || ""); if (!/NEW NFT MINT/i.test(text)) return payload;
@@ -116,7 +117,10 @@ function enrichDiscordNft(payload) {
   const contract = String((embed.fields || []).find(f => f?.name === "Contract")?.value || "").replace(/[`\\]/g, "").trim();
   const field = (embed.fields || []).find(f => f?.name === "Wallet Breakdown"); if (!chain || !contract || !field) return payload;
   const wallets = parseWalletLines(String(field.value || "").replace(/\*\*/g, ""));
-  const stats = updateWalletRegistry(chain, contract, wallets, `token:${String((embed.fields || []).find(f => f?.name === "Token ID")?.value || "")}`);
+  const tokenId = String((embed.fields || []).find(f => f?.name === "Token ID")?.value || "");
+  const txFromDescription = extractTxHash(embed.description);
+  const eventKey = txFromDescription ? `tx:${txFromDescription}` : (extractTxHash(tokenId) ? `tx:${extractTxHash(tokenId)}` : (tokenId ? `token:${tokenId}` : null));
+  const stats = updateWalletRegistry(chain, contract, wallets, eventKey);
   embed.fields = (embed.fields || []).filter(f => !["Wallet Breakdown", "Wallets involved", "Total Wallets"].includes(f?.name));
   embed.fields.push({ name: "Total Wallets Involved", value: String(stats.totalWallets), inline: true });
   embed.fields.push({ name: "Top Wallets · all tracked mints", value: stats.top.slice(0, 10).map((w, i) => `${i + 1}. ${displayWallet(w)} ×${w.count}`).join("\n") || "—", inline: false }); return payload;
@@ -139,7 +143,7 @@ function enrichDiscordToken(payload) {
   const field = (embed.fields || []).find(f => String(f?.name || "").startsWith("Tracked wallets that bought this")); if (!chain || !contract || !field) return payload;
   const wallets = String(field.value || "").split(/,\s*/).map(label => ({ label: label.replace(/\s*\(x\d+\)$/i, "").trim(), count: Number((label.match(/\(x(\d+)\)/i) || [])[1] || 1) }));
   const tx = String((embed.fields || []).find(f => f?.name === "Tx")?.value || "");
-  const stats = updateWalletRegistry(chain, contract, wallets, `tx:${tx}`);
+  const stats = updateWalletRegistry(chain, contract, wallets, tokenEventKey(tx));
   embed.fields = (embed.fields || []).filter(f => !["Total Wallets Involved", "Top Wallets · all tracked buys"].includes(f?.name));
   embed.fields.push({ name: "Total Wallets Involved", value: String(stats.totalWallets), inline: true });
   embed.fields.push({ name: "Top Wallets · all tracked buys", value: stats.top.slice(0, 10).map((w, i) => `${i + 1}. ${displayWallet(w)} ×${w.count}`).join("\n") || "—", inline: false }); return payload;
