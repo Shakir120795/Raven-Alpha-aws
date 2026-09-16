@@ -102,6 +102,50 @@ function getCollectionWalletStats(chainId, contract, currentWallets) {
   return { totalWallets: totals.size, top, current, newWallets };
 }
 
+function getTokenWalletStats(chainId, contract, currentWallets) {
+  const key = `${String(chainId || "").toLowerCase()}:${String(contract || "").toLowerCase()}`;
+  const totals = new Map();
+  const logs = store.get("alerts_log", []);
+  const walletKey = w => String(w?.walletId || w?.address || w?.label || "").trim().toLowerCase();
+  const display = w => w?.label || shortenWallet(w?.address || "unknown");
+
+  for (const alert of logs) {
+    if (alert?.type !== "wallet_new_token") continue;
+    const alertKey = `${String(alert.chain || "").toLowerCase()}:${String(alert.contract || "").toLowerCase()}`;
+    if (alertKey !== key) continue;
+    for (const w of alert.minters || []) {
+      const id = walletKey(w);
+      if (!id) continue;
+      const existing = totals.get(id) || { id, display: display(w), count: 0 };
+      existing.display = display(w);
+      existing.count += Number(w?.count || 1);
+      totals.set(id, existing);
+    }
+  }
+
+  const current = [];
+  for (const w of currentWallets || []) {
+    const id = walletKey(w);
+    if (!id) continue;
+    const item = { id, display: display(w), count: Number(w?.count || 1) };
+    current.push(item);
+    const existing = totals.get(id) || { id, display: item.display, count: 0 };
+    existing.display = item.display;
+    existing.count += item.count;
+    totals.set(id, existing);
+  }
+
+  const top = [...totals.values()].sort((a, b) => b.count - a.count || a.display.localeCompare(b.display));
+  const newWallets = current.filter(w => !logs.some(alert => {
+    if (alert?.type !== "wallet_new_token") return false;
+    const alertKey = `${String(alert.chain || "").toLowerCase()}:${String(alert.contract || "").toLowerCase()}`;
+    if (alertKey !== key) return false;
+    return (alert.minters || []).some(prev => walletKey(prev) === w.id);
+  })).sort((a, b) => b.count - a.count || a.display.localeCompare(b.display));
+
+  return { totalWallets: totals.size, top, current, newWallets };
+}
+
 function formatWalletRows(stats, maxRows = 12) {
   const rows = stats.top.slice(0, maxRows).map((w, i) => `${i + 1}. ${w.display} ×${w.count}`);
   const remaining = stats.top.length - maxRows;
@@ -169,6 +213,45 @@ function enrichDiscordNft(payload) {
   return payload;
 }
 
+function enrichTelegramToken(payload) {
+  const text = String(payload?.text || "");
+  if (!/New Token Buy/i.test(text)) return payload;
+  const chainMatch = text.match(/⛓ Chain:\s*<b>([^<]+)<\/b>/i);
+  const contractMatch = text.match(/📄 Contract:\s*<code>(0x[a-fA-F0-9]+)<\/code>/i);
+  const trackedMatch = text.match(/👥 Tracked wallets that bought this:\s*(.+)/i);
+  if (!chainMatch || !contractMatch || !trackedMatch) return payload;
+
+  const currentWallets = trackedMatch[1].split(/,\s*/).map(label => ({ label: label.replace(/\s*\(x\d+\)$/i, "").trim(), count: Number((label.match(/\(x(\d+)\)/i) || [])[1] || 1) }));
+  const stats = getTokenWalletStats(chainMatch[1], contractMatch[1], currentWallets);
+  const lines = text.split("\n");
+  const idx = lines.findIndex(line => /👥 Tracked wallets that bought this:/i.test(line));
+  if (idx >= 0) {
+    lines.splice(idx + 1, 0, `👥 Total wallets involved: <b>${stats.totalWallets}</b>`);
+    lines.splice(idx + 2, 0, `🏆 Top wallets: ${formatWalletRows(stats, 8)}`);
+  }
+  payload.text = lines.join("\n");
+  return payload;
+}
+
+function enrichDiscordToken(payload) {
+  const embed = payload?.embeds?.[0];
+  if (!embed || !/New .*Buy|Token.*Buy/i.test(String(embed.title || "") + " " + String(embed.description || ""))) return payload;
+  const chainField = (embed.fields || []).find(f => f?.name === "Chain");
+  const contractField = (embed.fields || []).find(f => f?.name === "Contract");
+  const trackedField = (embed.fields || []).find(f => String(f?.name || "").startsWith("Tracked wallets that bought this"));
+  const chain = String(chainField?.value || "").trim();
+  const contract = String(contractField?.value || "").replace(/[`\\]/g, "").trim();
+  if (!chain || !contract || !trackedField) return payload;
+
+  const currentWallets = String(trackedField.value || "").split(/,\s*/).map(label => ({ label: label.replace(/\s*\(x\d+\)$/i, "").trim(), count: Number((label.match(/\(x(\d+)\)/i) || [])[1] || 1) }));
+  const stats = getTokenWalletStats(chain, contract, currentWallets);
+  const fields = (embed.fields || []).filter(f => !["Total Wallets Involved", "Top Wallets · all tracked buys"].includes(f?.name));
+  fields.push({ name: "Total Wallets Involved", value: String(stats.totalWallets), inline: true });
+  fields.push({ name: "Top Wallets · all tracked buys", value: formatWalletRows(stats, 10), inline: false });
+  embed.fields = fields;
+  return payload;
+}
+
 const alertFetch = globalThis.fetch;
 globalThis.fetch = async (input, init = {}) => {
   const url = typeof input === "string" ? input : input?.url || "";
@@ -177,9 +260,9 @@ globalThis.fetch = async (input, init = {}) => {
     try {
       const payload = JSON.parse(init.body);
       if (/api\.telegram\.org\/bot/i.test(url)) {
-        init = { ...init, body: JSON.stringify(enrichTelegramNft(payload)) };
+        init = { ...init, body: JSON.stringify(enrichTelegramToken(enrichTelegramNft(payload))) };
       } else if (payload?.embeds?.[0]) {
-        init = { ...init, body: JSON.stringify(enrichDiscordNft(payload)) };
+        init = { ...init, body: JSON.stringify(enrichDiscordToken(enrichDiscordNft(payload))) };
       }
     } catch {}
   }
