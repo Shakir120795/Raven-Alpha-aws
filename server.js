@@ -96,9 +96,8 @@ function updateWalletRegistry(chain, contract, wallets, eventKey) {
   return { totalWallets: top.length, top };
 }
 function parseWalletLines(value) { return String(value || "").split("\n").map(s => s.trim()).filter(Boolean).map(line => { const m = line.match(/^(.+?)\s+×(\d+)$/); return m ? { label: m[1].trim(), count: Number(m[2]) } : null; }).filter(Boolean); }
-function extractTxHash(value) { const m = String(value || "").match(/0x[a-fA-F0-9]{64}/); return m ? m[0].toLowerCase() : null; }
-function nftEventKey(text) { const tx = extractTxHash(text); if (tx) return `tx:${tx}`; const m = String(text).match(/Sample Token ID:\s*<b>([^<]+)<\/b>/i); return m ? `token:${m[1]}` : null; }
-function tokenEventKey(text) { const tx = extractTxHash(text); return tx ? `tx:${tx}` : null; }
+function nftEventKey(text) { const m = String(text).match(/Sample Token ID:\s*<b>([^<]+)<\/b>/i); return m ? `token:${m[1]}` : `tx:${(String(text).match(/🧾 <code>([^<]+)/i) || [])[1] || Date.now()}`; }
+function tokenEventKey(text) { return `tx:${(String(text).match(/🧾 <code>([^<]+)/i) || [])[1] || Date.now()}`; }
 
 function enrichTelegramNft(payload) {
   const text = String(payload?.text || ""); if (!/NEW NFT MINT/i.test(text)) return payload;
@@ -117,10 +116,7 @@ function enrichDiscordNft(payload) {
   const contract = String((embed.fields || []).find(f => f?.name === "Contract")?.value || "").replace(/[`\\]/g, "").trim();
   const field = (embed.fields || []).find(f => f?.name === "Wallet Breakdown"); if (!chain || !contract || !field) return payload;
   const wallets = parseWalletLines(String(field.value || "").replace(/\*\*/g, ""));
-  const tokenId = String((embed.fields || []).find(f => f?.name === "Token ID")?.value || "");
-  const txFromDescription = extractTxHash(embed.description);
-  const eventKey = txFromDescription ? `tx:${txFromDescription}` : (extractTxHash(tokenId) ? `tx:${extractTxHash(tokenId)}` : (tokenId ? `token:${tokenId}` : null));
-  const stats = updateWalletRegistry(chain, contract, wallets, eventKey);
+  const stats = updateWalletRegistry(chain, contract, wallets, `token:${String((embed.fields || []).find(f => f?.name === "Token ID")?.value || "")}`);
   embed.fields = (embed.fields || []).filter(f => !["Wallet Breakdown", "Wallets involved", "Total Wallets"].includes(f?.name));
   embed.fields.push({ name: "Total Wallets Involved", value: String(stats.totalWallets), inline: true });
   embed.fields.push({ name: "Top Wallets · all tracked mints", value: stats.top.slice(0, 10).map((w, i) => `${i + 1}. ${displayWallet(w)} ×${w.count}`).join("\n") || "—", inline: false }); return payload;
@@ -143,10 +139,20 @@ function enrichDiscordToken(payload) {
   const field = (embed.fields || []).find(f => String(f?.name || "").startsWith("Tracked wallets that bought this")); if (!chain || !contract || !field) return payload;
   const wallets = String(field.value || "").split(/,\s*/).map(label => ({ label: label.replace(/\s*\(x\d+\)$/i, "").trim(), count: Number((label.match(/\(x(\d+)\)/i) || [])[1] || 1) }));
   const tx = String((embed.fields || []).find(f => f?.name === "Tx")?.value || "");
-  const stats = updateWalletRegistry(chain, contract, wallets, tokenEventKey(tx));
+  const stats = updateWalletRegistry(chain, contract, wallets, `tx:${tx}`);
   embed.fields = (embed.fields || []).filter(f => !["Total Wallets Involved", "Top Wallets · all tracked buys"].includes(f?.name));
   embed.fields.push({ name: "Total Wallets Involved", value: String(stats.totalWallets), inline: true });
   embed.fields.push({ name: "Top Wallets · all tracked buys", value: stats.top.slice(0, 10).map((w, i) => `${i + 1}. ${displayWallet(w)} ×${w.count}`).join("\n") || "—", inline: false }); return payload;
+}
+
+function isSoldOutNftTelegram(payload) {
+  const text = String(payload?.text || "");
+  return /NEW NFT MINT/i.test(text) && /🟢 Remaining:\s*<b>0<\/b>/i.test(text);
+}
+function isSoldOutNftDiscord(payload) {
+  const embed = payload?.embeds?.[0];
+  if (!embed || !/NEW NFT MINT/i.test(String(embed.title || ""))) return false;
+  return (embed.fields || []).some(f => f?.name === "Mint Progress" && /remaining\s+0\b/i.test(String(f.value || "")));
 }
 
 const alertFetch = globalThis.fetch;
@@ -156,8 +162,13 @@ globalThis.fetch = async (input, init = {}) => {
   if (method === "POST" && typeof init?.body === "string") {
     try {
       const payload = JSON.parse(init.body);
-      if (/api\.telegram\.org\/bot/i.test(url)) init = { ...init, body: JSON.stringify(enrichTelegramToken(enrichTelegramNft(payload))) };
-      else if (payload?.embeds?.[0]) init = { ...init, body: JSON.stringify(enrichDiscordToken(enrichDiscordNft(payload))) };
+      if (/api\.telegram\.org\/bot/i.test(url)) {
+        if (isSoldOutNftTelegram(payload)) return new Response(JSON.stringify({ ok: true, result: { message_id: 0 } }), { status: 200, headers: { "content-type": "application/json" } });
+        init = { ...init, body: JSON.stringify(enrichTelegramToken(enrichTelegramNft(payload))) };
+      } else if (payload?.embeds?.[0]) {
+        if (isSoldOutNftDiscord(payload)) return new Response("", { status: 204 });
+        init = { ...init, body: JSON.stringify(enrichDiscordToken(enrichDiscordNft(payload))) };
+      }
     } catch {}
   }
   return alertFetch(input, init);
@@ -177,6 +188,6 @@ app.get("/api/alerts", (req, res) => res.json(store.get("alerts_log", [])));
 app.get("/api/status", (req, res) => res.json({ lastScan: store.get("last_scan", null), walletsCount: getWallets().length, telegramConfigured: Boolean(process.env.TELEGRAM_TOKEN && process.env.TELEGRAM_CHAT_ID), discordConfigured: Boolean(process.env.DISCORD_WEBHOOK) }));
 app.post("/api/scan", requireSecret, async (req, res) => { try { const nft = await runNftScan(); const arcToken = await runArcTokenScan(); res.json({ ok: true, nft, arcToken }); } catch (e) { res.status(500).json({ ok: false, error: e.message }); } });
 app.listen(PORT, () => console.log(`🍌 Raven Alpha server running on port ${PORT}`));
-async function runScheduledScan() { const nft = await runNftScan(); const arcToken = await runArcTokenScan(); if (nft.skipped) console.log(`[${new Date().toISOString()}] NFT scan skipped:`, nft.reason); else console.log(`[${new Date().toISOString()}] NFT scan done:`, nft.walletsScanned || 0, "wallets,", nft.nftMints || 0, "new mints,", nft.alertsSent || 0, "collection alerts"); if (arcToken?.skipped) console.log(`[${new Date().toISOString()}] Arc token scan skipped:`, arcToken.reason); else console.log(`[${new Date().toISOString()}] Arc token scan:`, arcToken?.walletsScanned || 0, "wallets,", arcToken?.tokenTransfers || 0, "incoming ERC20 transfers,", arcToken?.tokenAlerts || 0, "new-token alerts"); }
+async function runScheduledScan() { const nft = await runNftScan(); const arcToken = await runArcTokenScan(); if (nft.skipped) console.log(`[${new Date().toISOString()}] NFT scan skipped:`, nft.reason); else console.log(`[${new Date().toISOString()}] NFT scan done:`, nft.walletsScanned || 0, "wallets,", nft.nftMints || 0, "new mints,", nft.alertsSent || 0, "collection alerts"); if (arcToken?.skipped) console.log(`[${new Date().toISOString()}] Arc token scan skipped:`, arcToken.reason); else console.log(`[${new Date().toISOString()}] Arc token scan:`, arcToken?.walletsScanned || 0, "wallets,", arcToken?.tokenTransfers || 0, "incoming ERC20 transfers,", arcToken?.tokenAlerts || 0, "token alerts"); }
 cron.schedule("*/5 * * * *", async () => { console.log(`[${new Date().toISOString()}] Running NFT + Arc token scan...`); try { await runScheduledScan(); } catch (e) { console.error("NFT/Arc token scan failed:", e.message); } });
 runScheduledScan().catch(e => console.error("Initial NFT/Arc token scan failed:", e.message));
